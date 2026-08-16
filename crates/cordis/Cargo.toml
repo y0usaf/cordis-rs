@@ -1,0 +1,12 @@
+[package]
+name = "cordis"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Spatiotemporal composability kernel with a WASM plugin boundary"
+
+[dependencies]
+wasmtime.workspace = true
+
+[dev-dependencies]
+wat = "1"

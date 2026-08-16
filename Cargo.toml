@@ -1,12 +1,11 @@
-[package]
-name = "cordis"
-version = "0.1.0"
+[workspace]
+members = ["crates/cordis"]
+resolver = "2"
+
+[workspace.package]
 edition = "2021"
-description = "Rust reimplementation of Cordis: spatiotemporal composability (revertible effects, reactive coeffects) with Lua scripting"
+version = "0.1.0"
+license = "MIT"
 
-[dependencies]
-mlua = { version = "0.10", features = ["lua54", "vendored", "async"] }
-tokio = { version = "1", features = ["rt", "macros", "time"] }
-
-[dev-dependencies]
-tokio = { version = "1", features = ["rt", "macros", "time"] }
+[workspace.dependencies]
+wasmtime = "47"
