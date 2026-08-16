@@ -1,0 +1,10 @@
+[package]
+name = "cordis"
+version = "0.1.0"
+edition = "2021"
+description = "Rust reimplementation of Cordis: spatiotemporal composability (revertible effects, reactive coeffects) with Lua scripting"
+
+[dependencies]
+mlua = { version = "0.10", features = ["lua54", "vendored"] }
+
+[dev-dependencies]
