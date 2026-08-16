@@ -14,47 +14,68 @@ pub struct Ctx(pub Rc<Context>);
 
 impl UserData for Ctx {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_method("plugin", |_lua, this, (callback, config): (Function, Option<Value>)| {
-            let config = config.unwrap_or(Value::Nil);
-            let fiber = this.0.clone().plugin(callback, config, HashMap::new())?;
-            Ok(FiberHandle(fiber))
-        });
-        methods.add_method(
+        methods.add_async_method(
+            "plugin",
+            |_lua, this, (callback, config): (Function, Option<Value>)| {
+                let ctx = this.0.clone();
+                async move {
+                    let config = config.unwrap_or(Value::Nil);
+                    let fiber = ctx.plugin(callback, config, HashMap::new()).await?;
+                    Ok(FiberHandle(fiber))
+                }
+            },
+        );
+        methods.add_async_method(
             "inject",
             |_lua, this, (deps, callback): (Value, Function)| {
-                let inject = parse_inject(&deps);
-                let fiber = this.0.clone().plugin(callback, Value::Nil, inject)?;
-                Ok(FiberHandle(fiber))
+                let ctx = this.0.clone();
+                async move {
+                    let inject = parse_inject(&deps);
+                    let fiber = ctx.plugin(callback, Value::Nil, inject).await?;
+                    Ok(FiberHandle(fiber))
+                }
             },
         );
-        methods.add_method(
+        methods.add_async_method(
             "effect",
             |_lua, this, (execute, label): (Function, Option<String>)| {
-                let label = label.unwrap_or_else(|| "anonymous".to_string());
-                let inner = this.0.effect(execute, &label)?;
-                Ok(EffectHandle(inner))
+                let ctx = this.0.clone();
+                async move {
+                    let label = label.unwrap_or_else(|| "anonymous".to_string());
+                    let inner = ctx.effect(execute, &label).await?;
+                    Ok(EffectHandle(inner))
+                }
             },
         );
-        methods.add_method(
+        methods.add_async_method(
             "on",
             |_lua, this, (name, listener): (String, Function)| {
-                let inner = this.0.on(&name, listener)?;
-                Ok(EffectHandle(inner))
+                let ctx = this.0.clone();
+                async move {
+                    let inner = ctx.on(&name, listener).await?;
+                    Ok(EffectHandle(inner))
+                }
             },
         );
-        methods.add_method(
+        methods.add_async_method(
             "once",
             |_lua, this, (name, listener): (String, Function)| {
-                let inner = this.0.once(&name, listener)?;
-                Ok(EffectHandle(inner))
+                let ctx = this.0.clone();
+                async move {
+                    let inner = ctx.once(&name, listener).await?;
+                    Ok(EffectHandle(inner))
+                }
             },
         );
-        methods.add_method(
+        methods.add_async_method(
             "provide",
             |_lua, this, (name, value): (String, Option<Value>)| {
-                let value = value.unwrap_or(Value::Nil);
-                let inner = this.0.provide(&name, value)?;
-                Ok(EffectHandle(inner))
+                let ctx = this.0.clone();
+                async move {
+                    let value = value.unwrap_or(Value::Nil);
+                    let inner = ctx.provide(&name, value).await?;
+                    Ok(EffectHandle(inner))
+                }
             },
         );
         methods.add_method("get", |_lua, this, name: String| {
@@ -72,28 +93,43 @@ impl UserData for Ctx {
         methods.add_method("extend", |_lua, this, _: ()| {
             Ok(Ctx(this.0.clone().extend()))
         });
-        methods.add_method("emit", |_lua, this, mut args: MultiValue| {
-            let name = pop_name(&mut args)?;
-            this.0.emit(&name, args)?;
-            Ok(())
+        methods.add_async_method("emit", |_lua, this, mut args: MultiValue| {
+            let ctx = this.0.clone();
+            async move {
+                let name = pop_name(&mut args)?;
+                ctx.emit(&name, args).await?;
+                Ok(())
+            }
         });
-        methods.add_method("parallel", |_lua, this, mut args: MultiValue| {
-            let name = pop_name(&mut args)?;
-            this.0.parallel(&name, args)?;
-            Ok(())
+        methods.add_async_method("parallel", |_lua, this, mut args: MultiValue| {
+            let ctx = this.0.clone();
+            async move {
+                let name = pop_name(&mut args)?;
+                ctx.parallel(&name, args).await?;
+                Ok(())
+            }
         });
-        methods.add_method("serial", |_lua, this, mut args: MultiValue| {
-            let name = pop_name(&mut args)?;
-            this.0.serial(&name, args)
+        methods.add_async_method("serial", |_lua, this, mut args: MultiValue| {
+            let ctx = this.0.clone();
+            async move {
+                let name = pop_name(&mut args)?;
+                ctx.serial(&name, args).await
+            }
         });
-        methods.add_method("bail", |_lua, this, mut args: MultiValue| {
-            let name = pop_name(&mut args)?;
-            this.0.bail(&name, args)
+        methods.add_async_method("bail", |_lua, this, mut args: MultiValue| {
+            let ctx = this.0.clone();
+            async move {
+                let name = pop_name(&mut args)?;
+                ctx.bail(&name, args).await
+            }
         });
-        methods.add_method("waterfall", |_lua, this, mut args: MultiValue| {
-            let name = pop_name(&mut args)?;
-            let final_fn = pop_fn(&mut args)?;
-            this.0.waterfall(&name, args, final_fn)
+        methods.add_async_method("waterfall", |_lua, this, mut args: MultiValue| {
+            let ctx = this.0.clone();
+            async move {
+                let name = pop_name(&mut args)?;
+                let final_fn = pop_fn(&mut args)?;
+                ctx.waterfall(&name, args, final_fn).await
+            }
         });
         methods.add_method("logger", |_lua, this, _: ()| Ok(Logger(this.0.clone())));
 
@@ -182,17 +218,26 @@ pub struct FiberHandle(pub Rc<Fiber>);
 
 impl UserData for FiberHandle {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_method("dispose", |_lua, this, _: ()| {
-            this.0.dispose();
-            Ok(())
+        methods.add_async_method("dispose", |_lua, this, _: ()| {
+            let fiber = this.0.clone();
+            async move {
+                fiber.dispose().await;
+                Ok(())
+            }
         });
-        methods.add_method("restart", |_lua, this, _: ()| {
-            this.0.restart();
-            Ok(())
+        methods.add_async_method("restart", |_lua, this, _: ()| {
+            let fiber = this.0.clone();
+            async move {
+                fiber.restart().await;
+                Ok(())
+            }
         });
-        methods.add_method("update", |_lua, this, config: Value| {
-            this.0.update(config);
-            Ok(())
+        methods.add_async_method("update", |_lua, this, config: Value| {
+            let fiber = this.0.clone();
+            async move {
+                fiber.update(config).await;
+                Ok(())
+            }
         });
         methods.add_method("name", |_lua, this, _: ()| Ok(this.0.name()));
         methods.add_method("state", |_lua, this, _: ()| {
@@ -214,9 +259,11 @@ impl UserData for FiberHandle {
 fn state_name(s: FiberState) -> &'static str {
     match s {
         FiberState::Pending => "PENDING",
+        FiberState::Loading => "LOADING",
         FiberState::Active => "ACTIVE",
         FiberState::Failed => "FAILED",
         FiberState::Disposed => "DISPOSED",
+        FiberState::Unloading => "UNLOADING",
     }
 }
 
@@ -229,9 +276,12 @@ pub struct EffectHandle(pub Rc<EffectInner>);
 
 impl UserData for EffectHandle {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_meta_method(MetaMethod::Call, |_lua, this, _: ()| {
-            this.0.run();
-            Ok(Value::Nil)
+        methods.add_async_meta_method(MetaMethod::Call, |_lua, this, _: ()| {
+            let inner = this.0.clone();
+            async move {
+                inner.run().await;
+                Ok(Value::Nil)
+            }
         });
     }
 }
@@ -278,7 +328,15 @@ impl LuaContext {
         Ok(LuaContext { lua, ctx })
     }
 
+    pub async fn run_async(&self, code: &str) -> Result<MultiValue, mlua::Error> {
+        self.lua.load(code).eval_async().await
+    }
+
     pub fn run(&self, code: &str) -> Result<MultiValue, mlua::Error> {
-        self.lua.load(code).eval()
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build tokio runtime");
+        rt.block_on(self.run_async(code))
     }
 }

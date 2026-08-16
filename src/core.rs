@@ -38,6 +38,8 @@
 use mlua::{Function, Lua, MultiValue, Value};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -53,6 +55,9 @@ pub fn next_id() -> u64 {
 // ---------------------------------------------------------------------------
 // disposables + effects
 // ---------------------------------------------------------------------------
+
+/// A boxed closure producing a boxed future (an async disposer).
+pub type AsyncDisposer = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()> + 'static>>>;
 
 pub struct EffectInner {
     pub label: String,
@@ -70,21 +75,23 @@ impl EffectInner {
     }
     /// Run collected disposers once, in reverse. Reversal is the temporal
     /// guarantee: the last effect mounted is the first undone, so teardown
-    /// never runs against a half-removed environment.
-    pub fn run(&self) {
+    /// never runs against a half-removed environment. Async disposers are
+    /// awaited in the same LIFO order.
+    pub async fn run(&self) {
         if self.ran.replace(true) {
             return;
         }
         let mut v = std::mem::take(&mut *self.disposables.borrow_mut());
         v.reverse();
         for d in v {
-            d.run();
+            d.run().await;
         }
     }
 }
 
 pub enum DisposableKind {
     Raw(Option<Box<dyn FnOnce()>>),
+    RawAsync(Option<AsyncDisposer>),
     Effect(Rc<EffectInner>),
 }
 
@@ -97,6 +104,11 @@ impl Disposable {
     pub fn raw(f: impl FnOnce() + 'static) -> Self {
         Disposable { id: next_id(), kind: DisposableKind::Raw(Some(Box::new(f))) }
     }
+    pub fn raw_async(
+        f: impl FnOnce() -> Pin<Box<dyn Future<Output = ()> + 'static>> + 'static,
+    ) -> Self {
+        Disposable { id: next_id(), kind: DisposableKind::RawAsync(Some(Box::new(f))) }
+    }
     pub fn effect(inner: Rc<EffectInner>) -> Self {
         Disposable { id: next_id(), kind: DisposableKind::Effect(inner) }
     }
@@ -106,14 +118,22 @@ impl Disposable {
             _ => None,
         }
     }
-    pub fn run(self) {
+    pub async fn run(self) {
         match self.kind {
             DisposableKind::Raw(f) => {
                 if let Some(f) = f {
                     f();
                 }
             }
-            DisposableKind::Effect(e) => e.run(),
+            DisposableKind::RawAsync(f) => {
+                if let Some(f) = f {
+                    f().await;
+                }
+            }
+            DisposableKind::Effect(e) => {
+                // Box to break the recursive future type (Effect -> Disposable -> Effect).
+                Box::pin(e.run()).await;
+            }
         }
     }
 }
@@ -161,9 +181,11 @@ impl DisposableList {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FiberState {
     Pending,
+    Loading,
     Active,
     Failed,
     Disposed,
+    Unloading,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -235,8 +257,8 @@ impl Fiber {
     }
 
     /// Run the plugin callback, collecting its effect into `self.disposables`.
-    fn reload(&self) {
-        match self.run_callback() {
+    async fn reload(&self) {
+        match self.run_callback().await {
             Ok(()) => {
                 self.error.replace(None);
             }
@@ -247,13 +269,13 @@ impl Fiber {
         self.state.set(self.get_state());
     }
 
-    fn run_callback(&self) -> Result<(), mlua::Error> {
+    async fn run_callback(&self) -> Result<(), mlua::Error> {
         let Some(cb) = self.callback.clone() else {
             return Ok(());
         };
         let ctx_ud = crate::lua::Ctx(self.ctx.clone());
         let config = self.config.borrow().clone();
-        let result: MultiValue = cb.call((ctx_ud, config))?;
+        let result: MultiValue = cb.call_async((ctx_ud, config)).await?;
         let mut collected: Vec<Disposable> = Vec::new();
         collect_effect_return(result, &mut collected);
         for d in collected {
@@ -262,27 +284,29 @@ impl Fiber {
         Ok(())
     }
 
-    fn unload(&self) {
+    async fn unload(&self) {
         let disposers = self.disposables.borrow_mut().clear();
         for d in disposers {
-            d.run();
+            d.run().await;
         }
         self.state.set(self.get_state());
     }
 
-    fn set_epoch(&self, epoch: Epoch) {
+    async fn set_epoch(&self, epoch: Epoch) {
         let old = self.epoch.replace(epoch.clone());
         if epoch == old {
             return;
         }
         if epoch != Epoch::Inactive {
-            self.reload();
+            self.state.set(FiberState::Loading);
+            self.reload().await;
         } else {
-            self.unload();
+            self.state.set(FiberState::Unloading);
+            self.unload().await;
         }
     }
 
-    pub fn refresh(&self) {
+    pub async fn refresh(&self) {
         let mut epoch = Epoch::Active(String::new());
         for name in self.inject.keys() {
             match self.ctx.shared.reflect.get_impl(self.ctx.isolate_key(name)) {
@@ -298,11 +322,11 @@ impl Fiber {
                 }
             }
         }
-        self.set_epoch(epoch);
+        self.set_epoch(epoch).await;
     }
 
     /// Cleanup on dispose: detach from runtime, unload own disposers.
-    fn cleanup(&self, remove: Box<dyn FnOnce()>) {
+    async fn cleanup(&self, remove: Box<dyn FnOnce()>) {
         self.uid.set(None);
         self.ctx.active.set(false);
         remove();
@@ -311,26 +335,27 @@ impl Fiber {
                 self.ctx.shared.registry.delete_runtime(rt);
             }
         }
-        self.set_epoch(Epoch::Inactive);
+        self.set_epoch(Epoch::Inactive).await;
     }
 
-    pub fn dispose(&self) {
-        if let Some(e) = self.dispose_effect.borrow().as_ref() {
-            e.run();
+    pub async fn dispose(&self) {
+        let e = self.dispose_effect.borrow().as_ref().cloned();
+        if let Some(e) = e {
+            e.run().await;
         }
     }
 
-    pub fn restart(&self) {
+    pub async fn restart(&self) {
         self.assert_active().unwrap();
-        self.set_epoch(Epoch::Inactive);
-        self.refresh();
+        self.set_epoch(Epoch::Inactive).await;
+        self.refresh().await;
     }
 
-    pub fn update(&self, config: Value) {
+    pub async fn update(&self, config: Value) {
         self.assert_active().unwrap();
         *self.config.borrow_mut() = config;
         self.error.replace(None);
-        self.restart();
+        self.restart().await;
     }
 
     pub fn get_effects(&self) -> Vec<String> {
@@ -342,17 +367,18 @@ impl Fiber {
     }
 
     /// Rust-side effect: run `execute`, collect its disposers.
-    pub fn effect_rust<F>(&self, execute: F, label: &str) -> Rc<EffectInner>
+    pub async fn effect_rust<F, Fut>(&self, execute: F, label: &str) -> Rc<EffectInner>
     where
-        F: FnOnce(&mut Collector),
+        F: FnOnce(Collector) -> Fut,
+        Fut: Future<Output = ()>,
     {
         self.assert_active().unwrap();
         let inner = EffectInner::new(label.to_string());
-        let mut collector = Collector {
+        let collector = Collector {
             inner: inner.clone(),
             fiber_list: self.disposables.clone(),
         };
-        execute(&mut collector);
+        execute(collector).await;
         finish_effect(inner.clone(), self.disposables.clone());
         inner
     }
@@ -371,6 +397,12 @@ impl Collector {
     }
     pub fn collect_raw(&mut self, f: impl FnOnce() + 'static) {
         self.inner.disposables.borrow_mut().push(Disposable::raw(f));
+    }
+    pub fn collect_raw_async(
+        &mut self,
+        f: impl FnOnce() -> Pin<Box<dyn Future<Output = ()> + 'static>> + 'static,
+    ) {
+        self.inner.disposables.borrow_mut().push(Disposable::raw_async(f));
     }
 }
 
@@ -394,8 +426,10 @@ fn collect_effect_return(result: MultiValue, list: &mut Vec<Disposable>) {
     match v {
         Value::Nil => {}
         Value::Function(f) => {
-            list.push(Disposable::raw(move || {
-                let _ = f.call::<()>(());
+            list.push(Disposable::raw_async(move || -> Pin<Box<dyn Future<Output = ()> + 'static>> {
+                Box::pin(async move {
+                    let _ = f.call_async::<()>(()).await;
+                })
             }));
         }
         Value::Table(t) => {
@@ -409,9 +443,13 @@ fn collect_effect_return(result: MultiValue, list: &mut Vec<Disposable>) {
                     break;
                 }
                 if let Value::Function(f) = v {
-                    list.push(Disposable::raw(move || {
-                        let _ = f.call::<()>(());
-                    }));
+                    list.push(Disposable::raw_async(
+                        move || -> Pin<Box<dyn Future<Output = ()> + 'static>> {
+                            Box::pin(async move {
+                                let _ = f.call_async::<()>(()).await;
+                            })
+                        },
+                    ));
                 }
                 i += 1;
             }
@@ -463,11 +501,11 @@ impl RegistryService {
         let mut runtimes = self.runtimes.borrow_mut();
         runtimes.retain(|(_, r)| !Rc::ptr_eq(r, rt));
     }
-    pub fn delete(&self, cb: &Function) {
+    pub async fn delete(&self, cb: &Function) {
         if let Some(rt) = self.find(cb) {
             let fibers = std::mem::take(&mut *rt.fibers.borrow_mut());
             for f in fibers {
-                f.dispose();
+                f.dispose().await;
             }
             self.delete_runtime(&rt);
         }
@@ -646,11 +684,15 @@ impl Context {
 
     /// Lua-side effect: run `execute` (a Lua function), collect its return as
     /// disposers, and register a wrapper with the fiber.
-    pub fn effect(&self, execute: Function, label: &str) -> Result<Rc<EffectInner>, mlua::Error> {
+    pub async fn effect(
+        &self,
+        execute: Function,
+        label: &str,
+    ) -> Result<Rc<EffectInner>, mlua::Error> {
         self.assert_active()?;
         let fiber = self.fiber();
         let inner = EffectInner::new(label.to_string());
-        let result: MultiValue = execute.call::<MultiValue>(())?;
+        let result: MultiValue = execute.call_async(()).await?;
         let mut collected: Vec<Disposable> = Vec::new();
         collect_effect_return(result, &mut collected);
         for d in collected {
@@ -663,7 +705,11 @@ impl Context {
 
     // -- services -----------------------------------------------------------
 
-    pub fn provide(&self, name: &str, value: Value) -> Result<Rc<EffectInner>, mlua::Error> {
+    pub async fn provide(
+        &self,
+        name: &str,
+        value: Value,
+    ) -> Result<Rc<EffectInner>, mlua::Error> {
         self.assert_active()?;
         let fiber = self.fiber();
         let name = name.to_string();
@@ -679,27 +725,36 @@ impl Context {
         }
         let key = self.isolate_key(&name);
         let lua = shared.lua.clone();
-        let execute = lua.create_function(move |_, _: ()| {
-            let impl_ = Rc::new(Impl {
-                name: name.clone(),
-                fiber: fiber.clone(),
-                value: RefCell::new(value.clone()),
-            });
-            shared.reflect.store.borrow_mut().insert(key, impl_.clone());
-            if fiber.state.get() == FiberState::Active {
-                notify(shared.clone(), &[name.clone()]);
+        let execute = lua.create_async_function(move |lua, _: ()| {
+            let shared = shared.clone();
+            let fiber = fiber.clone();
+            let name = name.clone();
+            let value = value.clone();
+            async move {
+                let impl_ = Rc::new(Impl {
+                    name: name.clone(),
+                    fiber: fiber.clone(),
+                    value: RefCell::new(value),
+                });
+                shared.reflect.store.borrow_mut().insert(key, impl_);
+                if fiber.state.get() == FiberState::Active {
+                    let names = vec![name.clone()];
+                    notify(shared.clone(), &names).await;
+                }
+                let disposer = lua.create_async_function(move |_, _: ()| {
+                    let shared = shared.clone();
+                    let name = name.clone();
+                    async move {
+                        shared.reflect.store.borrow_mut().remove(&key);
+                        let names = vec![name];
+                        notify(shared, &names).await;
+                        Ok(())
+                    }
+                })?;
+                Ok(Value::Function(disposer))
             }
-            let shared2 = shared.clone();
-            let name2 = name.clone();
-            let key2 = key;
-            let lua2 = shared2.lua.clone();
-            Ok(Value::Function(lua2.create_function(move |_, _: ()| {
-                shared2.reflect.store.borrow_mut().remove(&key2);
-                notify(shared2.clone(), &[name2.clone()]);
-                Ok(())
-            })?))
         })?;
-        self.effect(execute, &label)
+        self.effect(execute, &label).await
     }
 
     pub fn get(&self, name: &str) -> Option<Value> {
@@ -750,7 +805,7 @@ impl Context {
 
     // -- plugins ------------------------------------------------------------
 
-    pub fn plugin(
+    pub async fn plugin(
         self: Rc<Context>,
         callback: Function,
         config: Value,
@@ -799,15 +854,25 @@ impl Context {
         let parent_fiber = parent_fiber;
         let fiber2 = fiber.clone();
         let runtime2 = runtime.clone();
-        let effect = parent_fiber.effect_rust(
-            move |c| {
-                let remove = runtime2.push_fiber(fiber2.clone());
-                fiber2.refresh();
-                let f = fiber2.clone();
-                c.collect_raw(move || f.cleanup(remove));
-            },
-            "ctx.plugin()",
-        );
+        let effect = parent_fiber
+            .effect_rust(
+                move |mut c| {
+                    let runtime2 = runtime2.clone();
+                    let fiber2 = fiber2.clone();
+                    async move {
+                        let remove = runtime2.push_fiber(fiber2.clone());
+                        fiber2.refresh().await;
+                        let f = fiber2.clone();
+                        c.collect_raw_async(move || -> Pin<Box<dyn Future<Output = ()> + 'static>> {
+                            Box::pin(async move {
+                                f.cleanup(remove).await;
+                            })
+                        });
+                    }
+                },
+                "ctx.plugin()",
+            )
+            .await;
         *fiber.dispose_effect.borrow_mut() = Some(effect);
 
         Ok(fiber)
@@ -815,7 +880,7 @@ impl Context {
 
     // -- events -------------------------------------------------------------
 
-    pub fn on(
+    pub async fn on(
         &self,
         name: &str,
         listener: Function,
@@ -843,21 +908,26 @@ impl Context {
                 Ok(())
             })?))
         })?;
-        self.effect(execute, &label)
+        self.effect(execute, &label).await
     }
 
-    pub fn once(&self, name: &str, listener: Function) -> Result<Rc<EffectInner>, mlua::Error> {
+    pub async fn once(&self, name: &str, listener: Function) -> Result<Rc<EffectInner>, mlua::Error> {
         let dispose_cell: Rc<RefCell<Option<Rc<EffectInner>>>> = Rc::new(RefCell::new(None));
         let shared = self.shared.clone();
         let listener2 = listener.clone();
         let cell2 = dispose_cell.clone();
-        let wrapped = shared.lua.create_function(move |_, args: MultiValue| {
-            if let Some(e) = cell2.borrow().as_ref() {
-                e.run();
+        let wrapped = shared.lua.create_async_function(move |_, args: MultiValue| {
+            let cell2 = cell2.clone();
+            let listener2 = listener2.clone();
+            async move {
+                let effect = cell2.borrow().as_ref().cloned();
+                if let Some(e) = effect {
+                    e.run().await;
+                }
+                listener2.call_async::<MultiValue>(args).await
             }
-            listener2.call::<MultiValue>(args)
         })?;
-        let effect = self.on(name, wrapped)?;
+        let effect = self.on(name, wrapped).await?;
         *dispose_cell.borrow_mut() = Some(effect.clone());
         Ok(effect)
     }
@@ -870,18 +940,18 @@ impl Context {
             .unwrap_or_default()
     }
 
-    pub fn emit(&self, name: &str, args: MultiValue) -> Result<(), mlua::Error> {
+    pub async fn emit(&self, name: &str, args: MultiValue) -> Result<(), mlua::Error> {
         let callbacks = self.resolve_hooks(name);
         for cb in callbacks {
-            let _ = cb.call::<MultiValue>(args.clone())?;
+            let _ = cb.call_async::<MultiValue>(args.clone()).await?;
         }
         Ok(())
     }
 
-    pub fn serial(&self, name: &str, args: MultiValue) -> Result<Value, mlua::Error> {
+    pub async fn serial(&self, name: &str, args: MultiValue) -> Result<Value, mlua::Error> {
         let callbacks = self.resolve_hooks(name);
         for cb in callbacks {
-            let r: MultiValue = cb.call(args.clone())?;
+            let r: MultiValue = cb.call_async(args.clone()).await?;
             if let Some(v) = r.into_iter().next() {
                 if !(v.is_nil() || v == Value::Boolean(false)) {
                     return Ok(v);
@@ -891,15 +961,15 @@ impl Context {
         Ok(Value::Nil)
     }
 
-    pub fn bail(&self, name: &str, args: MultiValue) -> Result<Value, mlua::Error> {
-        self.serial(name, args)
+    pub async fn bail(&self, name: &str, args: MultiValue) -> Result<Value, mlua::Error> {
+        self.serial(name, args).await
     }
 
-    pub fn parallel(&self, name: &str, args: MultiValue) -> Result<(), mlua::Error> {
+    pub async fn parallel(&self, name: &str, args: MultiValue) -> Result<(), mlua::Error> {
         let callbacks = self.resolve_hooks(name);
         let mut errors: Vec<String> = Vec::new();
         for cb in callbacks {
-            if let Err(e) = cb.call::<MultiValue>(args.clone()) {
+            if let Err(e) = cb.call_async::<MultiValue>(args.clone()).await {
                 errors.push(format!("{e}"));
             }
         }
@@ -913,7 +983,7 @@ impl Context {
         }
     }
 
-    pub fn waterfall(
+    pub async fn waterfall(
         &self,
         name: &str,
         args: MultiValue,
@@ -932,17 +1002,24 @@ impl Context {
             let cell = next_cell.clone();
             let (callbacks, idx, args, final_fn) =
                 (callbacks.clone(), idx.clone(), args.clone(), final_fn.clone());
-            shared.lua.create_function(move |_, _: ()| {
-                let i = idx.get();
-                if i < callbacks.len() {
-                    idx.set(i + 1);
-                    let cb = callbacks[i].clone();
-                    let mut a = args.as_ref().clone();
-                    let guard = cell.borrow();
-                    a.push_back(Value::Function(guard.as_ref().unwrap().clone()));
-                    cb.call::<Value>(a)
-                } else {
-                    final_fn.call::<Value>(args.as_ref().clone())
+            shared.lua.create_async_function(move |_, _: ()| {
+                let cell = cell.clone();
+                let callbacks = callbacks.clone();
+                let idx = idx.clone();
+                let args = args.clone();
+                let final_fn = final_fn.clone();
+                async move {
+                    let i = idx.get();
+                    if i < callbacks.len() {
+                        idx.set(i + 1);
+                        let cb = callbacks[i].clone();
+                        let mut a = args.as_ref().clone();
+                        let next_fn = cell.borrow().as_ref().unwrap().clone();
+                        a.push_back(Value::Function(next_fn));
+                        cb.call_async::<Value>(a).await
+                    } else {
+                        final_fn.call_async::<Value>(args.as_ref().clone()).await
+                    }
                 }
             })?
         };
@@ -953,9 +1030,9 @@ impl Context {
         let i = idx.get();
         if i < callbacks.len() {
             idx.set(i + 1);
-            callbacks[i].call::<Value>(a)
+            callbacks[i].call_async::<Value>(a).await
         } else {
-            final_fn.call::<Value>(args.as_ref().clone())
+            final_fn.call_async::<Value>(args.as_ref().clone()).await
         }
     }
 
@@ -980,7 +1057,7 @@ impl Context {
 /// Reactive coeffect engine. After a context change names a set of keys, walk
 /// every mounted fiber and re-resolve any whose inject spec names one of those
 /// keys. A fiber that lost a dependency unloads; one that gained one reloads.
-pub fn notify(shared: Rc<Shared>, names: &[String]) {
+pub async fn notify(shared: Rc<Shared>, names: &[String]) {
     let runtimes: Vec<Rc<Runtime>> = shared
         .registry
         .runtimes
@@ -992,7 +1069,7 @@ pub fn notify(shared: Rc<Shared>, names: &[String]) {
         let fibers: Vec<Rc<Fiber>> = rt.fibers.borrow().clone();
         for fiber in fibers {
             if names.iter().any(|name| fiber.inject.contains_key(name)) {
-                fiber.refresh();
+                fiber.refresh().await;
             }
         }
     }

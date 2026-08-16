@@ -1,6 +1,8 @@
 //! Integration tests mirroring the upstream Cordis core test suite.
 
 use cordis::lua::LuaContext;
+use std::cell::RefCell;
+use std::rc::Rc;
 
 fn run(code: &str) -> Result<(), mlua::Error> {
     let app = LuaContext::new()?;
@@ -33,6 +35,54 @@ fn effect_dispose_reverse_order() {
         "#,
     )
     .unwrap();
+}
+
+/// An async effect's disposers run LIFO (reverse order) on unmount, awaited.
+#[tokio::test(flavor = "current_thread")]
+async fn async_effect_disposer_reverse_order() {
+    use cordis::core::Context;
+    use mlua::Lua;
+
+    let lua = Lua::new();
+    let ctx = Context::new_root(&lua);
+
+    let order: Rc<RefCell<Vec<i32>>> = Rc::new(RefCell::new(Vec::new()));
+
+    let make_disposer = |n: i32| {
+        let order = order.clone();
+        lua.create_async_function(move |_lua, ()| {
+            let order = order.clone();
+            async move {
+                order.borrow_mut().push(n);
+                Ok(())
+            }
+        })
+    };
+
+    let d1 = make_disposer(1).unwrap();
+    let d2 = make_disposer(2).unwrap();
+    let d3 = make_disposer(3).unwrap();
+
+    let execute = lua
+        .create_function(move |lua, ()| {
+            let t = lua.create_table().unwrap();
+            t.set(1, d1.clone()).unwrap();
+            t.set(2, d2.clone()).unwrap();
+            t.set(3, d3.clone()).unwrap();
+            Ok(t)
+        })
+        .unwrap();
+
+    let effect = ctx.effect(execute, "test").await.unwrap();
+    assert!(order.borrow().is_empty());
+
+    // Unmount: run the effect's disposers, which must be awaited in reverse.
+    effect.run().await;
+    assert_eq!(*order.borrow(), vec![3, 2, 1]);
+
+    // Idempotent.
+    effect.run().await;
+    assert_eq!(*order.borrow(), vec![3, 2, 1]);
 }
 
 #[test]
