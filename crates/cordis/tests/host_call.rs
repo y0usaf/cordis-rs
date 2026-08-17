@@ -55,6 +55,35 @@ fn call_void_form_result_via_ctx_return() {
 }
 
 #[test]
+fn call_single_value_scratch_form() {
+    // A Rust-authored guest can't emit a `(i32,i32)` return (rustc lowers it
+    // to C sret on wasm32-unknown-unknown), so `scratch() -> i32` is also
+    // accepted: the value is the buffer base and a fixed 64 KiB capacity is
+    // derived. The entry still returns (ret_ptr, ret_len) into memory.
+    let guest = r#"(module
+  (memory (export "memory") 2)
+  ;; scratch returns a single pointer into memory (offset 0). Result written
+  ;; back at the same region by the export, which echoes a payload length.
+  (func (export "scratch") (result i32) i32.const 0)
+  (func (export "mount"))
+  (func (export "entry") (param i32 i32) (result i32 i32)
+    ;; copy "OK\x00" into memory at offset 8 and return (8, 2)
+    (i32.store8 (i32.const 8) (i32.const 79))   ;; O
+    (i32.store8 (i32.const 9) (i32.const 75))   ;; K
+    i32.const 8 i32.const 2)
+  (func (export "on_change") (param i32 i32))
+)"#;
+    let wasm = wat::parse_str(guest).expect("valid wat");
+    let mut ctx = Context::new();
+    let id = ctx.mount(&wasm).expect("mount");
+    let result = ctx.call(id, "entry", "any-payload").expect("call");
+    assert_eq!(
+        result, "OK",
+        "single-value scratch form delivers the result"
+    );
+}
+
+#[test]
 fn runaway_guest_traps_cleanly_no_residue() {
     // (c) a guest that overruns the fuel budget traps (not panic) and leaves
     // no state residue; the plugin stays mounted and the store recovers.

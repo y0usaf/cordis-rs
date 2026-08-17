@@ -49,7 +49,10 @@
 //! `(ptr, len) -> (ret_ptr, ret_len)` **or** `(ptr, len) -> ()` + `ctx_return`,
 //! drains the ops the guest emitted during the call, and reads the result
 //! string back. Fuel-metered by [`CALL_FUEL_BUDGET`] so a runaway guest traps
-//! instead of hanging the host.
+//! instead of hanging the host. The `scratch()` export may be either
+//! `() -> (ptr, cap)` (hand-written `.wat` guests) or `() -> ptr` (Rust-authored
+//! guests, since rustc lowers a `(i32, i32)` return to C sret on
+//! `wasm32-unknown-unknown`); see [`Context::scratch_region`].
 
 use std::collections::HashMap;
 use wasmtime::*;
@@ -321,15 +324,51 @@ impl Context {
         plugin.mounted = false;
     }
 
+    /// Resolve the guest's scratch buffer for host->guest payload/notify
+    /// writes. Backward-compatible with two guest shapes:
+    /// - `scratch() -> (ptr, cap)` — the classic multi-value form (hand-written
+    ///   `.wat` guests). The returned pointer is the buffer base and `cap` is
+    ///   its byte capacity.
+    /// - `scratch() -> ptr` — the single-value form a Rust-authored guest can
+    ///   actually emit (rustc cannot lower a `(i32, i32)` return on
+    ///   `wasm32-unknown-unknown` without C sret). Here the guest reserves a
+    ///   fixed scratch arena and the host derives a 64 KiB capacity; the
+    ///   buffer base is `mem[ptr]`.
+    ///
+    /// Returns `(ptr, cap)`; validates both are non-negative.
+    fn scratch_region(&mut self, id: usize) -> Result<(i32, i32)> {
+        const DEFAULT_SINGLE_CAP: i32 = 64 * 1024;
+        self.assert_mounted(id)?;
+        let instance = self.store.data().plugins[id].instance;
+        if let Ok(scratch) = instance.get_typed_func::<(), (i32, i32)>(&mut self.store, "scratch") {
+            let (ptr, cap) = scratch.call(&mut self.store, ())?;
+            if ptr < 0 || cap < 0 {
+                return Err(wasmtime::Error::msg(
+                    "guest scratch pointer/capacity negative",
+                ));
+            }
+            return Ok((ptr, cap));
+        }
+        if let Ok(scratch) = instance.get_typed_func::<(), i32>(&mut self.store, "scratch") {
+            let ptr = scratch.call(&mut self.store, ())?;
+            if ptr < 0 {
+                return Err(wasmtime::Error::msg("guest scratch pointer negative"));
+            }
+            return Ok((ptr, DEFAULT_SINGLE_CAP));
+        }
+        Err(wasmtime::Error::msg(
+            "guest must export scratch() -> (i32, i32) or scratch() -> i32",
+        ))
+    }
+
     /// Deliver a changed key to a reader: write it into the guest's reserved
     /// scratch buffer and invoke its `on_change`.
     fn notify(&mut self, id: usize, key: &str) -> Result<()> {
-        let instance = self.store.data().plugins[id].instance;
-        let scratch = instance.get_typed_func::<(), (i32, i32)>(&mut self.store, "scratch")?;
-        let (ptr, cap) = scratch.call(&mut self.store, ())?;
-        if ptr < 0 || cap < 0 || key.len() > cap as usize {
+        let (ptr, cap) = self.scratch_region(id)?;
+        if key.len() > cap as usize {
             return Err(wasmtime::Error::msg("guest scratch buffer too small"));
         }
+        let instance = self.store.data().plugins[id].instance;
         let mem = instance
             .get_memory(&mut self.store, "memory")
             .ok_or_else(|| wasmtime::Error::msg("guest must export memory"))?;
@@ -382,9 +421,8 @@ impl Context {
         plugins[id].result = None;
 
         let instance = self.store.data().plugins[id].instance;
-        let scratch = instance.get_typed_func::<(), (i32, i32)>(&mut self.store, "scratch")?;
-        let (ptr, cap) = scratch.call(&mut self.store, ())?;
-        if ptr < 0 || cap < 0 || payload.len() > cap as usize {
+        let (ptr, cap) = self.scratch_region(id)?;
+        if payload.len() > cap as usize {
             return Err(wasmtime::Error::msg(
                 "guest scratch buffer too small for payload",
             ));
@@ -513,16 +551,43 @@ impl Context {
             (ip, il),
             (rp, rl)
         );
-        register_fn!(
-            linker,
+        // `register_overlay` carries its description and mode attachment
+        // alongside the render/key/init handlers, so a leader-attached
+        // (session-list) overlay can be reconstructed by the host. Descriptor
+        // shape: [description, render, key, init, attach_mode].
+        linker.func_wrap(
+            "host",
             "register_overlay",
-            "overlay",
-            (np, nl),
-            (dp, dl),
-            (rp, rl),
-            (hkp, hkl),
-            (ip, il)
-        );
+            |mut caller: Caller<'_, State>,
+             np: i32,
+             nl: i32,
+             dp: i32,
+             dl: i32,
+             rp: i32,
+             rl: i32,
+             hkp: i32,
+             hkl: i32,
+             ip: i32,
+             il: i32,
+             ap: i32,
+             al: i32|
+             -> Result<(), wasmtime::Error> {
+                let name = read_str(&mut caller, np, nl)?;
+                let desc = read_str(&mut caller, dp, dl)?;
+                let render = read_str(&mut caller, rp, rl)?;
+                let key = read_str(&mut caller, hkp, hkl)?;
+                let init = read_str(&mut caller, ip, il)?;
+                let attach = read_str(&mut caller, ap, al)?;
+                if let Some(id) = caller.data().current_id {
+                    caller.data_mut().plugins[id].registered.push((
+                        name,
+                        "overlay".to_string(),
+                        vec![desc, render, key, init, attach],
+                    ));
+                }
+                Ok(())
+            },
+        )?;
         register_fn!(
             linker,
             "register_theme",
@@ -571,15 +636,13 @@ impl Context {
                     return Err(wasmtime::Error::msg("invalid surface descriptor"));
                 }
                 let name = read_str(&mut caller, np, nl)?;
-                let descriptors = vec![
-                    dock.to_string(),
-                    priority.to_string(),
-                    size.to_string(),
-                ];
+                let descriptors = vec![dock.to_string(), priority.to_string(), size.to_string()];
                 if let Some(id) = caller.data().current_id {
-                    caller.data_mut().plugins[id]
-                        .registered
-                        .push((name, "surface".to_string(), descriptors));
+                    caller.data_mut().plugins[id].registered.push((
+                        name,
+                        "surface".to_string(),
+                        descriptors,
+                    ));
                 }
                 Ok(())
             },
