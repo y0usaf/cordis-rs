@@ -63,7 +63,11 @@ fn unmount_restores_pre_existing_key() {
     assert_eq!(ctx.get("mode").as_deref(), Some("command"));
 
     ctx.unmount(id).expect("unmount");
-    assert_eq!(ctx.get("mode").as_deref(), Some("existing"), "pre-existing key must be restored");
+    assert_eq!(
+        ctx.get("mode").as_deref(),
+        Some("existing"),
+        "pre-existing key must be restored"
+    );
 }
 
 #[test]
